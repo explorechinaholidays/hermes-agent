@@ -605,7 +605,7 @@ def init_agent(
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
     run_budget_seconds: Optional[float] = None,
-    fallback_model: Dict[str, Any] = None,
+    fallback_model: "Dict[str, Any] | List[Dict[str, Any]] | None" = None,
     credential_pool=None,
     checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20,
@@ -1407,11 +1407,16 @@ def init_agent(
                     except Exception:
                         pass
                     # --- Init-time fallback (#17929) ---
+                    # Per-model tiering: entries with ``for_models`` only
+                    # participate when the agent's primary model matches.
+                    from hermes_cli.fallback_config import entry_matches_model
+
                     _fb_entries = []
                     if isinstance(fallback_model, list):
                         _fb_entries = [
                             f for f in fallback_model
                             if isinstance(f, dict) and f.get("provider") and f.get("model")
+                            and entry_matches_model(f, agent.model)
                         ]
                     elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
                         _fb_entries = [fallback_model]
@@ -1571,10 +1576,19 @@ def init_agent(
     # when the primary is exhausted (rate-limit, overload, connection
     # failure).  Supports both legacy single-dict ``fallback_model`` and
     # new list ``fallback_providers`` format.
+    #
+    # Per-model tiering: an entry may declare ``for_models`` (exact or
+    # trailing-``*`` prefix patterns). Entries whose patterns don't match
+    # the agent's primary model are dropped here so the runtime walk,
+    # the init-time rescue above, and the banner all see the same
+    # effective chain. Entries without ``for_models`` stay global.
+    from hermes_cli.fallback_config import entry_matches_model as _entry_matches_model
+
     if isinstance(fallback_model, list):
         agent._fallback_chain = [
             f for f in fallback_model
             if isinstance(f, dict) and f.get("provider") and f.get("model")
+            and _entry_matches_model(f, agent.model)
         ]
     elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
         agent._fallback_chain = [fallback_model]

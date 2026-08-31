@@ -3057,6 +3057,29 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 _UNSET = object()
 
 
+def _configured_primary_model(cfg: dict | None) -> str | None:
+    """Best-effort primary model name from a loaded gateway config.
+
+    Used to apply ``for_models`` filtering at load/refresh time so callers
+    without the turn's model in scope still get a tier-appropriate chain.
+    Returns None on any ambiguity — the chain then falls back to the
+    unfiltered behavior (global entries only participate everywhere anyway;
+    ``for_models`` entries are conservatively KEPT when the primary is
+    unknown, matching fail-open semantics).
+    """
+    try:
+        model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+        if isinstance(model_cfg, dict):
+            model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+            if model:
+                return model
+        if isinstance(model_cfg, str) and model_cfg.strip():
+            return model_cfg.strip()
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -3088,7 +3111,17 @@ def _resolve_runtime_agent_kwargs() -> dict:
             logger.warning("Primary provider rate-limited (429): %s — trying fallback", auth_exc)
         else:
             logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
-        fb_config = _try_resolve_fallback_provider()
+        # Tier the auth-rescue by the configured primary model so a
+        # ``for_models``-tagged entry never rescues a primary it wasn't
+        # declared for. (Pre-resolution — the runtime model isn't known
+        # yet, which is exactly why we're here.)
+        try:
+            _primary_for_tiering = _configured_primary_model(
+                _load_gateway_runtime_config()
+            )
+        except Exception:
+            _primary_for_tiering = None
+        fb_config = _try_resolve_fallback_provider(primary_model=_primary_for_tiering)
         if fb_config is not None:
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
@@ -3318,15 +3351,19 @@ def _credential_pool_for_provider(provider: Optional[str]):
         return None
 
 
-def _try_resolve_fallback_provider() -> dict | None:
-    """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
+def _try_resolve_fallback_provider(primary_model: str | None = None) -> dict | None:
+    """Attempt to resolve credentials from the fallback_model/fallback_providers config.
+
+    When *primary_model* is given, entries carrying ``for_models`` that
+    don't match it are skipped (per-model fallback tiering).
+    """
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         # Canonical gateway loader: managed overlay + ${VAR} expansion +
         # root-model normalization now reach the fallback chain too (a raw
         # read here used to miss administrator-pinned fallback_providers).
         cfg = _load_gateway_runtime_config()
-        fb_list = get_fallback_chain(cfg)
+        fb_list = get_fallback_chain(cfg, primary_model=primary_model)
         if not fb_list:
             return None
         for entry in fb_list:
@@ -6052,7 +6089,12 @@ class TurnRunner:
         # serialization (_running_agents) keeps this safe post-lock.
         if reused_cached_agent and agent is not None:
             self._runner._apply_fallback_chain_to_agent(
-                agent, self._runner._refresh_fallback_model(),
+                agent,
+                # Tier to THIS agent's primary — a cached agent must never
+                # inherit another primary's ``for_models`` entries.
+                self._runner._refresh_fallback_model(
+                    primary_model=getattr(agent, "model", None)
+                ),
             )
 
         # Lock released — now schedule cleanup of any cross-process-evicted
@@ -6109,7 +6151,11 @@ class TurnRunner:
                 gateway_session_key=ctx.session_key,
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
-                fallback_model=self._runner._refresh_fallback_model(),
+                # Tiered to the turn's model so ``for_models`` entries from
+                # other primaries never ride along.
+                fallback_model=self._runner._refresh_fallback_model(
+                    primary_model=turn_route.get("model")
+                ),
                 skip_context_files=skip_context_files,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
@@ -10332,20 +10378,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Returns the merged effective chain from ``fallback_providers`` plus any
         legacy ``fallback_model`` entries. ``fallback_providers`` stays first
-        when both keys are present.
+        when both keys are present. Entries with ``for_models`` that don't
+        match the configured primary model are filtered out (per-model
+        tiering).
         """
         try:
             # Canonical gateway loader (fail-open): managed overlay + ${VAR}
             # expansion now apply to the fallback chain too.
             cfg = _load_gateway_runtime_config()
-            fb = get_fallback_chain(cfg)
+            fb = get_fallback_chain(
+                cfg, primary_model=_configured_primary_model(cfg)
+            )
             if fb:
                 return fb
         except Exception:
             pass
         return None
 
-    def _refresh_fallback_model(self) -> list | None:
+    def _refresh_fallback_model(self, primary_model: str | None = None) -> list | None:
         """Re-read fallback_providers from disk for the next agent create/reuse.
 
         Cron already does this per job via ``get_fallback_chain``; the gateway
@@ -10353,6 +10403,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         configured (or changed) after ``hermes gateway`` was running never
         reached messaging sessions even though the same process's cron jobs
         fell back correctly. Fixes #60955.
+
+        When *primary_model* is given, ``for_models``-tagged entries that
+        don't match it are dropped so a cached agent only ever sees the
+        tiers that apply to its primary model.
 
         A TRANSIENT read/parse failure (user mid-edit of config.yaml with a
         non-atomic write) keeps the last known-good chain instead of wiping a
@@ -10389,7 +10443,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "keeping last known-good chain", exc_info=True,
             )
             return self._fallback_model
-        self._fallback_model = get_fallback_chain(cfg) or None
+        self._fallback_model = (
+            get_fallback_chain(cfg, primary_model=primary_model) or None
+        )
         return self._fallback_model
 
     @staticmethod
@@ -24073,7 +24129,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=source.thread_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=self._refresh_fallback_model(),
+                    # Tiered to the background task's model.
+                    fallback_model=self._refresh_fallback_model(
+                        primary_model=model
+                    ),
                 )
                 try:
                     return agent.run_conversation(

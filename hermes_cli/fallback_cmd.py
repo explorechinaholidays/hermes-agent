@@ -13,8 +13,11 @@ Subcommands:
   hermes fallback clear    Remove all fallback entries
 
 Storage: ``fallback_providers`` in ``~/.hermes/config.yaml`` (top-level, list of
-``{provider, model, base_url?, api_mode?}`` dicts).  The legacy single-dict
-``fallback_model`` format is migrated to the new list format on first add.
+``{provider, model, base_url?, api_mode?, for_models?}`` dicts).  The legacy
+single-dict ``fallback_model`` format is migrated to the new list format on
+first add.  An entry may carry ``for_models: ["glm-5.3", "glm-5.3*"]`` to
+restrict it to matching primary models (exact or trailing-``*`` prefix,
+case-insensitive); entries without ``for_models`` are global.
 """
 from __future__ import annotations
 
@@ -48,11 +51,21 @@ def _write_chain(config: Dict[str, Any], chain: List[Dict[str, Any]]) -> None:
 
 
 def _format_entry(entry: Dict[str, Any]) -> str:
-    """One-line human-readable rendering of a fallback entry."""
+    """One-line human-readable rendering of a fallback entry.
+
+    Entries carrying ``for_models`` (per-model tiering) render their scope,
+    e.g. ``qwen3.8-max  (via custom:qwen)  (for: glm-5.3*)``. Entries without
+    it stay global and render exactly as before (back-compat).
+    """
     provider = entry.get("provider", "?")
     model = entry.get("model", "?")
     base = entry.get("base_url")
     suffix = f"  [{base}]" if base else ""
+    raw = entry.get("for_models")
+    if isinstance(raw, (list, tuple)):
+        patterns = [p.strip() for p in raw if isinstance(p, str) and p.strip()]
+        if patterns:
+            suffix += f"  (for: {', '.join(patterns)})"
     return f"{model}  (via {provider}){suffix}"
 
 

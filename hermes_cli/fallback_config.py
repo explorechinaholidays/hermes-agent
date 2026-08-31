@@ -77,13 +77,76 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
-def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
+def entry_matches_model(entry: dict[str, Any], primary_model: str | None) -> bool:
+    """True when *entry* applies to the primary model *primary_model*.
+
+    Entries may carry an optional ``for_models`` list restricting which
+    primary models they serve (per-model fallback tiering)::
+
+        fallback_providers:
+          - provider: custom:qwen
+            model: qwen3.8-max
+            for_models: ["glm-5.3"]        # only when glm-5.3 is primary
+          - provider: custom:qwen
+            model: qwen3.8-flash
+            for_models: ["glm-5.3-flash"]
+
+    Match rules per pattern (case-insensitive):
+
+    - ``"glm-5.3*"`` — trailing ``*`` is a prefix wildcard: matches
+      ``glm-5.3`` and ``glm-5.3-flash`` alike.
+    - ``"glm-5.3"`` — exact match only.
+
+    Back-compat: an entry WITHOUT ``for_models`` (or with an empty /
+    malformed one — no valid non-empty string patterns) is GLOBAL and
+    matches every primary. Fallback is a resilience mechanism, so a
+    restriction that parses to nothing fails open toward "applies" —
+    an entry must never silently drop out of the chain because of a
+    typo'd key.
+    """
+    if not primary_model:
+        return True
+    raw = entry.get("for_models")
+    if not isinstance(raw, (list, tuple)):
+        # Absent key (or a scalar/garbage value) → global entry.
+        return True
+    patterns = [
+        p.strip().lower()
+        for p in raw
+        if isinstance(p, str) and p.strip()
+    ]
+    if not patterns:
+        # ``for_models: []`` (or all-empty) → no usable restriction.
+        return True
+    primary = primary_model.strip().lower()
+    if not primary:
+        return True
+    for pattern in patterns:
+        if pattern.endswith("*"):
+            if primary.startswith(pattern[:-1]):
+                return True
+        elif primary == pattern:
+            return True
+    return False
+
+
+def get_fallback_chain(
+    config: dict[str, Any] | None,
+    primary_model: str | None = None,
+) -> list[dict[str, Any]]:
     """Return the effective fallback chain merged across old and new config keys.
 
     ``fallback_providers`` remains the primary source of truth and keeps its
     order. Legacy ``fallback_model`` entries are appended afterwards unless
     they target the same provider/model/base_url route as an earlier entry.
     The returned list always contains fresh dict copies.
+
+    When *primary_model* is given, entries carrying ``for_models`` are
+    filtered to those whose patterns match the primary (see
+    ``entry_matches_model``); entries without ``for_models`` stay global.
+    Omitting *primary_model* returns the unfiltered chain (legacy behavior —
+    call sites that don't know the primary, e.g. presence checks, keep
+    working unchanged).
     """
 
     config = config or {}
@@ -92,6 +155,8 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
 
     for key in ("fallback_providers", "fallback_model"):
         for entry in _iter_fallback_entries(config.get(key)):
+            if not entry_matches_model(entry, primary_model):
+                continue
             identity = _entry_identity(entry)
             if identity in seen:
                 continue
