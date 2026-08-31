@@ -83,11 +83,29 @@ def test_background_and_main_agent_paths_call_refresh():
     # The agent-construction site inside TurnRunner.run_sync (extracted from
     # the old _run_agent_inner closure) references the runner as
     # ``self._runner``; the background-agent site still uses bare ``self``.
+    # T11 per-model tiering threads ``primary_model=`` into each refresh so
+    # the chain is tiered to the turn's model.
     _refresh_calls = (
         source.count("fallback_model=self._refresh_fallback_model()")
         + source.count("fallback_model=self._runner._refresh_fallback_model()")
+        + source.count("fallback_model=self._refresh_fallback_model(")
+        + source.count("fallback_model=self._runner._refresh_fallback_model(")
     )
     assert _refresh_calls >= 2
+    # Per-model tiering (T11): EVERY refresh at an agent create/reuse site
+    # must be tiered to a primary model — an unfiltered refresh would let a
+    # cached agent inherit another primary's ``for_models`` entries.
+    import re as _re
+    _refresh_args = _re.findall(
+        r"fallback_model=(?:self\.)?(?:_runner\.)?_refresh_fallback_model\(([^)]*)",
+        source,
+    )
+    assert len(_refresh_args) >= 2
+    for _args in _refresh_args:
+        assert "primary_model=" in _args, (
+            "un-tiered _refresh_fallback_model call at an agent "
+            f"create/reuse site: _refresh_fallback_model({_args!r})"
+        )
     # The cached-agent reuse path (the load-bearing fix for a long-lived
     # session in a running gateway) must apply the refreshed chain.
     assert (
