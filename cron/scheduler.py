@@ -6174,7 +6174,10 @@ def run_job(
                 reason,
                 resolve_exc,
             )
-            fb_list = get_fallback_chain(_cfg)
+            fb_list = get_fallback_chain(
+                _cfg,
+                primary_model=model if isinstance(model, str) else None,
+            )
             runtime = None
             for entry in fb_list:
                 if not isinstance(entry, dict):
@@ -6309,7 +6312,15 @@ def run_job(
                     f"config is pinned or restored. See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        # Per-model tiering: tier the chain to THIS job's resolved primary so
+        # ``for_models`` entries for other primaries never ride along.
+        fallback_model = (
+            get_fallback_chain(
+                _cfg,
+                primary_model=model if isinstance(model, str) else None,
+            )
+            or None
+        )
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:

@@ -470,8 +470,9 @@ def _run_agent(
     try:
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
-        # gateway sessions.
-        _fb = get_fallback_chain(cfg)
+        # gateway sessions. Tiered to this run's primary model so
+        # ``for_models`` entries for other primaries never participate.
+        _fb = get_fallback_chain(cfg, primary_model=effective_model)
 
         agent = AIAgent(
             api_key=runtime.get("api_key"),
